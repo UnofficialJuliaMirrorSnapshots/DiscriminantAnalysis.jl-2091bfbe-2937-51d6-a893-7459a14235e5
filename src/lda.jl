@@ -11,97 +11,118 @@ mutable struct LinearDiscriminantModel{T} <: DiscriminantModel{T}
     detΣ::T
     "Matrix of class means (one per row/column depending on `dims`)"
     M::Matrix{T}
+    "Overall centroid"
+    μ::Vector{T}
     "Vector of class prior probabilities"
     π::Vector{T}
+    "Class counts"
+    nₘ::Vector{Int}
     "Canonical coordinates"
     C::Union{Nothing,Matrix{T}}
     "Canonical coordinates with whitening"
     A::Union{Nothing,Matrix{T}}
     "Shrinkage parameter"
     γ::Union{Nothing,T}
-    function LinearDiscriminantModel{T}(M::AbstractMatrix, π::AbstractVector; 
-                                        dims::Integer=1, canonical::Bool=false,
-                                        gamma::Union{Nothing,Real}=nothing) where T
-        k, p = check_centroid_dims(M, π, dims=dims)
-
-        k ≥ 2 || error("must have at least two classes")
-
-        check_priors(π)
-
-        if gamma !== nothing
-            0 ≤ gamma ≤ 1 || throw(DomainError(gamma, "γ must be in the interval [0,1]"))
-        end
-
-        W = zeros(T, p, p)
-
-        if canonical
-            d = min(k-1, p)
-            C = dims == 1 ? zeros(T, p, d) : zeros(T, d, p)
-            A = copy(C)
-        else
-            C = nothing
-            A = nothing
-        end
-
-        new{T}(false, dims, W, zero(T), M, π, C, A, gamma)
+    function LinearDiscriminantModel{T}() where T
+        new{T}(false, 0, Array{T}(undef,0,0), zero(T), Array{T}(undef,0,0), 
+               Array{T}(undef,0), Array{T}(undef,0), Array{Int}(undef,0), nothing, nothing, 
+               nothing)
     end
 end
 
-function canonical_coordinates!(LDA::LinearDiscriminantModel)
-    M = copy(LDA.M)
-    k, p = check_dims(M, LDA.dims)
 
-    π = LDA.π
+function canonical_coordinates!(LDA::LinearDiscriminantModel{T}) where T
+    m, p = check_dims(LDA.M, dims=LDA.dims)
 
-    if p ≤ k-1
+    if p ≤ m-1
         # no dimensionality reduction is possible
-        C = I
+        LDA.C = Matrix{Float64}(I, p, p)
+        LDA.A = copy(LDA.W)
     elseif LDA.dims == 1
-        # Σ = Mᵀdiag(π)M so need to scale by sqrt π
-        broadcast!((a,b) -> a*√(b), M, M, π)
-        UDVᵀ = svd!(M*W, full=false)
-        C = transpose(view(UDVᵀ.Vt, 1:k-1, :))
-    else
-        broadcast!((a,b) -> a*√(b), M, M, transpose(π))
-        UDVᵀ = svd!(W*M, full=false)
-        C = transpose(view(UDVᵀ.U, :, 1:k-1))
-    end
+        # center M by overall centroid
+        M = broadcast!(-, similar(LDA.M, T), LDA.M, transpose(LDA.μ))
+        # Σ_between = Mᵀdiag(π)M so need to scale by sqrt π
+        broadcast!((πₖ, Mₖⱼ) -> √(πₖ)Mₖⱼ, M, LDA.π, M)
+        UDVᵀ = svd!(M*LDA.W, full=false)
 
-    copyto!(LDA.C, C)
-
-    if LDA.dims == 1
-        mul!(LDA.A, LDA.W, LDA.C)
+        LDA.C = copy(transpose(view(UDVᵀ.Vt, 1:m-1, :)))
+        LDA.A = LDA.W*LDA.C
     else
-        mul!(LDA.A, LDA.C, LDA.W)
+        M = broadcast!(-, similar(LDA.M, T), LDA.M, LDA.μ)
+        broadcast!((πₖ, Mⱼₖ) -> √(πₖ)Mⱼₖ, M, transpose(LDA.π), M)
+        UDVᵀ = svd!(LDA.W*M, full=false)
+
+        LDA.C = copy(transpose(view(UDVᵀ.U, :, 1:m-1)))
+        LDA.A = LDA.C*LDA.W
     end
 
     return LDA
 end
 
-#function canonical_coordinates(M::AbstractMatrix{T}, W::AbstractMatrix{T}, π::Vector{T},
-#                               dims::Integer) where T
-#    dims ∈ (1, 2) || arg_error("dims should be 1 or 2 (got $(dims))")
-#    k = size(M, dims)
-#    p = size(M, dims == 1 ? 2 : 1)
-#
-#    length(π) == k || dim_error("")
-#
-#    all(size(W) .== p) || dim_error("W must match dimensions of M")
-#
-#    d = min(k-1, p)
-#
-#    if dims == 1
-#        MW = (sqrt.(π) .* M)*W
-#        UDVᵀ = svd!(MW, full=false)
-#        Cᵀ = view(UDVᵀ.Vt, 1:d, :)
-#    else
-#        WM = W*(transpose(sqrt.(π)) .* M)
-#        UDVᵀ = svd!(WM, full=false)
-#        Cᵀ = view(UDVᵀ.U, :, 1:d)
-#    end
-#
-#    return transpose(Cᵀ)
-#end
+function _fit!(LDA::LinearDiscriminantModel{T},
+               y::Vector{<:Integer},
+               X::Matrix{T},
+               dims::Integer=1,
+               canonical::Bool=false,
+               centroids::Union{Nothing,AbstractMatrix}=nothing, 
+               priors::Union{Nothing,AbstractVector}=nothing,
+               gamma::Union{Nothing,Real}=nothing) where T
+    n, p = check_data_dims(X, y, dims=dims)
+    m = maximum(y)
+    LDA.dims = dims
+
+    if gamma !== nothing
+        0 ≤ gamma ≤ 1 || throw(DomainError(gamma, "γ must be in the interval [0,1]"))
+    end
+    LDA.γ = gamma
+
+    # Compute class counts for hypothesis tests
+    LDA.nₘ = class_counts!(zeros(Int, m), y)
+    all(LDA.nₘ .≥ 2) || error("must have at least two observations per class")
+
+    # Compute priors from class frequencies in data if not specified
+    if priors === nothing
+        LDA.π = broadcast!(/, Vector{T}(undef, m), LDA.nₘ, n)
+    else
+        LDA.π = copyto!(similar(priors, T), priors)
+    end
+    check_priors(LDA.π)
+
+    # Compute centroids from data if not specified
+    if centroids === nothing
+        LDA.M = dims == 1 ? zeros(T, m, p) : zeros(T, p, m)
+        class_centroids!(LDA.M, X, y, dims=dims)
+    else
+        check_centroid_dims(centroids, X, dims=dims)
+        LDA.M = copyto!(similar(centroids, T), centroids)
+    end
+    if size(LDA.M, dims) != m
+        error("here error")
+    end
+
+    # Overall centroid is prior-weighted average of class centroids
+    LDA.μ = LDA.dims == 1 ? transpose(LDA.π)*M : M*LDA.π
+
+    center_classes!(X, y, LDA.M, dims=dims)
+
+    # Use cholesky whitening if gamma is not specifed, otherwise svd whitening
+    if LDA.γ === nothing
+        LDA.W, LDA.detΣ = whiten_data!(X, dims=dims)
+    else
+        LDA.W, LDA.detΣ = whiten_data!(X, LDA.γ, dims=dims)
+    end
+
+    if canonical
+        canonical_coordinates!(LDA)
+    else
+        LDA.C = nothing
+        LDA.A = nothing
+    end
+
+    LDA.fit = true
+
+    return LDA
+end
 
 
 """
