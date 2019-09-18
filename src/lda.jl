@@ -69,49 +69,52 @@ function _fit!(LDA::LinearDiscriminantModel{T},
                gamma::Union{Nothing,Real}=nothing) where T
     n, p = check_data_dims(X, y, dims=dims)
     m = maximum(y)
+
     LDA.dims = dims
+    is_row = dims == 1
 
     if gamma !== nothing
         0 ≤ gamma ≤ 1 || throw(DomainError(gamma, "γ must be in the interval [0,1]"))
     end
     LDA.γ = gamma
 
-    # Compute class counts for hypothesis tests
-    LDA.nₘ = class_counts!(zeros(Int, m), y)
+    # Compute centroids and class counts from data if not specified
+    if centroids === nothing
+        LDA.M = is_row ? Matrix{T}(undef, m, p) : Matrix{T}(undef, p, m)
+        LDA.nₘ = Vector{Int}(undef, m)
+        class_statistics!(LDA.M, LDA.nₘ, X, y, dims=dims)
+    else
+        check_centroid_dims(centroids, X, dims=dims)
+        size(centroids, dims) == m || throw(DimensionMismatch("bad class count in M"))
+        LDA.M = copyto!(similar(centroids, T), centroids)
+        LDA.nₘ = class_counts!(Vector{Int}(undef, m), y)
+    end
+
     all(LDA.nₘ .≥ 2) || error("must have at least two observations per class")
 
     # Compute priors from class frequencies in data if not specified
     if priors === nothing
         LDA.π = broadcast!(/, Vector{T}(undef, m), LDA.nₘ, n)
     else
+        validate_priors(priors)
+        length(priors) == m || throw(DimensionMismatch("bad length"))
         LDA.π = copyto!(similar(priors, T), priors)
-    end
-    check_priors(LDA.π)
-
-    # Compute centroids from data if not specified
-    if centroids === nothing
-        LDA.M = dims == 1 ? zeros(T, m, p) : zeros(T, p, m)
-        class_centroids!(LDA.M, X, y, dims=dims)
-    else
-        check_centroid_dims(centroids, X, dims=dims)
-        LDA.M = copyto!(similar(centroids, T), centroids)
-    end
-    if size(LDA.M, dims) != m
-        error("here error")
     end
 
     # Overall centroid is prior-weighted average of class centroids
-    LDA.μ = LDA.dims == 1 ? transpose(LDA.π)*M : M*LDA.π
+    LDA.μ = is_row ? vec(transpose(LDA.π)*LDA.M) : LDA.M*LDA.π
 
-    center_classes!(X, y, LDA.M, dims=dims)
+    # Center the data matrix with respect to classes to compute whitening matrix
+    X .-= is_row ? view(LDA.M, y, :) : view(LDA.M, :, y)
 
     # Use cholesky whitening if gamma is not specifed, otherwise svd whitening
     if LDA.γ === nothing
-        LDA.W, LDA.detΣ = whiten_data!(X, dims=dims)
+        LDA.W, LDA.detΣ = whiten_data!(X, dims=dims, df=n-m)
     else
-        LDA.W, LDA.detΣ = whiten_data!(X, LDA.γ, dims=dims)
+        LDA.W, LDA.detΣ = whiten_data!(X, LDA.γ, dims=dims, df=n-m)
     end
 
+    # Perform canonical discriminant analysis if applicable
     if canonical
         canonical_coordinates!(LDA)
     else
