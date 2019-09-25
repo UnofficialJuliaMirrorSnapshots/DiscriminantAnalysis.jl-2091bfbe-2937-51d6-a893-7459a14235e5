@@ -11,36 +11,6 @@ function check_dims(X::AbstractMatrix; dims::Integer)
     return (n, p)
 end
 
-function check_data_dims(X::AbstractMatrix, y::AbstractVector; dims::Integer)
-    n, p = check_dims(X, dims=dims)
-    n₂ = length(y)
-
-    if n != n₂
-        rc = dims == 1 ? "rows" : "columns"
-        msg = "the number of $(rc) in data matrix X must match the length of class index " *
-              "vector y (got $(n) and $(n₂))"
-
-        throw(DimensionMismatch(msg))
-    end
-
-    return n, p
-end
-
-function check_centroid_dims(M::AbstractMatrix, X::AbstractMatrix; dims::Integer)
-    n, p = check_dims(X, dims=dims)
-    m, p₂ = check_dims(M, dims=dims)
-    
-    if p != p₂
-        rc = dims == 1 ? "columns" : "rows"
-        msg = "the number of $(rc) in centroid matrix M must match the number of $(rc) " *
-              "in data matrix X (got $(p₂) and $(p))"
-
-        throw(DimensionMismatch(msg))
-    end
-
-    return (n, p, m)
-end
-
 
 ### Data/Parameter Validation
 
@@ -49,8 +19,8 @@ function validate_priors(π::AbstractVector{T}) where T
 
     for (k, πₖ) in enumerate(π)
         if !(zero(T) < πₖ < one(T))
-            throw(DomainError(πₖ, "class prior probability at index $(k) must be in the " *
-                                  "open interval (0,1)"))
+            throw(DomainError(πₖ, "class prior probability at class index $(k) must be " *
+                                  "in the open interval (0,1)"))
         end
         total += πₖ
     end
@@ -60,6 +30,14 @@ function validate_priors(π::AbstractVector{T}) where T
     end
 
     return length(π)
+end
+
+function validate_class_counts(nₘ::AbstractVector{T}) where {T <: Integer}
+    for (k, nₖ) in enumerate(nₘ)
+        nₖ > 1 || error("class count at class index $(k) must be greater than 1")
+    end
+
+    return length(nₘ)
 end
 
 
@@ -91,10 +69,14 @@ Backend for `class_statistics!` - assumes `dims=2`.
 """
 function _class_statistics!(M::AbstractMatrix, nₘ::Vector{<:Integer}, X::AbstractMatrix, 
                             y::Vector{<:Integer})
-    n, p, m = check_centroid_dims(M, X, dims=2)
-    check_data_dims(X, y, dims=2)
+    p, n = size(X)
+    p₂, m = size(M)
+    n₂ = length(y)
+    m₂ = length(nₘ)
 
-    length(nₘ) == m || throw(DimensionMismatch("length of nₘ must match M"))
+    p == p₂ || throw(DimensionMismatch("predictor count mismatch between M and X"))
+    n == n₂ || throw(DimensionMismatch("observation count mismatch between y and X"))
+    m == m₂ || throw(DimensionMismatch("class count mismatch between nₘ and M"))
 
     T = eltype(nₘ)
 
@@ -124,17 +106,31 @@ Overwrites matrix `M` with class centroids from `X` based on class indexes from 
 """
 function class_statistics!(M::AbstractMatrix, nₘ::Vector{<:Integer}, X::AbstractMatrix, 
                            y::Vector{<:Integer}; dims::Integer=1)
+    n, p = check_dims(X, dims=dims)
+    m, p₂ = check_dims(M, dims=dims)
+    n₂ = length(y)
+    m₂ = length(nₘ)
+
+    altdims = dims == 1 ? 2 : 1
+    
+    p == p₂ || throw(DimensionMismatch("predictor count along dimension $(altdims) of X " *
+                                       "must match dimension $(altdims) of M (got $(p) " * 
+                                       "and $(p₂))"))
+    n == n₂ || throw(DimensionMismatch("observation count along length of y must match " *
+                                       "dimension $(dims) of X (got $(n) and $(n₂))"))
+    m == m₂ || throw(DimensionMismatch("class count along length of nₘ must match " *
+                                       "dimension $(dims) of M (got $(m₂) and $(m))"))
+
     if dims == 1
-        check_centroid_dims(M, X, dims=1)
-        check_data_dims(X, y, dims=1)
         _class_statistics!(transpose(M), nₘ, transpose(X), y)
         return (M, nₘ)
-    elseif dims ==2
+    else dims == 2
         return _class_statistics!(M, nₘ, X, y)
-    else
-        throw(ArgumentError("dims should be 1 or 2 (got $dims)"))
     end
 end
+
+
+### Regularization
 
 """
     regularize!(Σ₁, Σ₂, λ)
@@ -174,106 +170,3 @@ function regularize!(Σ::AbstractMatrix{T}, γ::T) where {T}
 
     return Σ
 end
-
-
-### Data Whitening Functions
-
-"""
-    whiten_data!(X; dims, df)
-
-Compute a whitening transform matrix for centered data matrix `X`. Use `dims=1` for 
-row-based observations and `dims=2` for column-based observations. The `df` parameter 
-specifies the effective degrees of freedom.
-"""
-function whiten_data!(X::Matrix{T}; dims::Integer, df::Integer=size(X,dims)-1) where T
-    df > 0 || error("degrees of freedom must be greater than 0")
-
-    n, p = check_dims(X, dims=dims)
-
-    n > p || error("insufficient number of within-class observations to produce a full " *
-                   "rank covariance matrix ($(n) observations, $(p) predictors)")
-
-    if dims == 1
-        # X = QR ⟹ S = XᵀX = RᵀR
-        R = UpperTriangular(qr!(X, Val(false)).R)  
-    else
-        # Xᵀ = LQ ⟹ S = XXᵀ = LLᵀ = RᵀR
-        R = UpperTriangular(transpose(lq!(X).L))  
-    end
-
-    broadcast!(/, R, R, √(df))
-
-    detΣ = det(R)^2
-
-    W = try
-        inv(R)
-    catch err
-        if isa(err, LAPACKException) || isa(err, SingularException)
-            if err.info ≥ 1
-                error("rank deficiency detected (collinearity in predictors)")
-            end
-        end
-        throw(err)
-    end
-
-    if dims == 1
-        return (W, detΣ)
-    else
-        return (copy(transpose(W)), detΣ)
-    end
-end
-
-@inline regularize(x, y, γ) = (1-γ)*x + γ*y
-
-function whiten_data!(X::Matrix{T}, γ::T; dims::Integer, df::Integer=size(X,dims)-1) where T
-    n, p = check_dims(X, dims=dims)
-    
-    n > p || error("insufficient number of within-class observations to produce a full " *
-                   "rank covariance matrix ($(n) observations, $(p) predictors)")
-    
-    0 ≤ γ ≤ 1 || throw(DomainError(γ, "γ must be in the interval [0,1]"))
-
-    tol = eps(one(T))*p*maximum(X)
-
-    UDVᵀ = svd!(X, full=false)
-
-    D = UDVᵀ.S
-
-    if γ ≠ zero(T)
-        # Regularize: Σ = VD²Vᵀ ⟹ Σ(γ) = V((1-γ)D² + (γ/p)trace(D²)I)Vᵀ
-        broadcast!(σᵢ -> abs2(σᵢ)/df, D, D)  # Convert data singular values to Σ eigenvalues
-        broadcast!(regularize, D, D, mean(D), γ)
-        detΣ = prod(D)
-        broadcast!(√, D, D)
-    else
-        detΣ = prod(σᵢ -> abs2(σᵢ)/df, D)
-        broadcast!(/, D, D, √(df))
-    end
-
-    all(D .> tol) || error("rank deficiency (collinearity) detected with tolerance $(tol)")
-
-    # Whitening matrix
-    if dims == 1
-        Vᵀ = UDVᵀ.Vt
-        Wᵀ = broadcast!(/, Vᵀ, Vᵀ, D)  # in-place diagonal matrix multiply DVᵀ
-    else
-        U = UDVᵀ.U
-        Wᵀ = broadcast!(/, U, U, transpose(D))
-    end
-
-    return (copy(transpose(Wᵀ)), detΣ)
-end
-
-
-function whiten_cov!(Σ::AbstractMatrix{T}, γ::T=zero(T)) where T
-    (p = size(Σ, 1)) == size(Σ, 2) || throw(DimensionMismatch("Σ must be square"))
-
-    0 ≤ γ ≤ 1 || throw(DomainError(γ, "γ must be in the interval [0,1]"))
-    
-    if γ != 0
-        regularize!(Σ, γ)
-    end
-    
-    W = inv(cholesky!(Σ, Val(false); check=true).U)
-end
-
