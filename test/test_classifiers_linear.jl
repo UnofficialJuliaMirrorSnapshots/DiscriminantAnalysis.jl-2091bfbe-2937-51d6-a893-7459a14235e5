@@ -107,7 +107,7 @@ end
                     @test lda_test.Θ.dims == 1
                     @test lda_test.Θ.γ == γ
                     @test isapprox(lda_test.Θ.M, Mt_test)
-                    @test isapprox(lda_test.δ, det(Σ_test))
+                    @test isapprox(lda_test.δ₀, det(Σ_test))
                     if compute_cov
                         @test isapprox(lda_test.Θ.Σ, Σ)
                     else
@@ -127,7 +127,7 @@ end
                     @test lda_test.Θ.dims == 2
                     @test lda_test.Θ.γ == γ
                     @test isapprox(lda_test.Θ.M, M_test)
-                    @test isapprox(lda_test.δ, det(Σ_test))
+                    @test isapprox(lda_test.δ₀, det(Σ_test))
                     if compute_cov
                         @test isapprox(lda_test.Θ.Σ, Σ)
                     else
@@ -141,5 +141,37 @@ end
                 end
             end
         end
+    end
+end
+
+@testset "discriminants!(Δ, LDA, X)" begin
+    n = 500
+
+    for T in (Float32, Float64)
+        y = repeat([1,2], inner=n)
+        M = T[2 -2; 
+              2 -2]
+
+        Z = randn(T, 2, 2*n)
+        for k = 1:2
+            Z[:, y .== k] .-= mean(Z[:, y .== k], dims=2)
+        end
+        Z = sqrt(inv(Z*transpose(Z)/(2n-2)))*Z
+
+        X = Z + M[:, y]
+        C = T[sqrt(2)/2 sqrt(2)/2]
+
+        Δ = zeros(T, 2, 2n)
+        for k = 1:2
+            Δ[k, :] = log(convert(T, 0.5)) .- sum(abs2.(X .- M[:, k:k]), dims=1)/2
+        end
+
+        lda_test = DA.fit!(DA.LinearDiscriminantModel{T}(), y, copy(X), dims=2, canonical=false)
+        Δ_test = DA.discriminants!(zeros(T, 2, 2n), lda_test, X)
+
+        @test isapprox(Δ_test, Δ)
+
+        lda_test = DA.fit!(DA.LinearDiscriminantModel{T}(), y, copy(transpose(X)), dims=1, canonical=false)
+        Δ_test = DA.discriminants!(zeros(T, 2n, 2), lda_test, copy(transpose(X)))
     end
 end

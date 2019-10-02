@@ -7,7 +7,7 @@ Compute a whitening transform matrix for centered data matrix `X`. Use `dims=1` 
 row-based observations and `dims=2` for column-based observations. The `df` parameter 
 specifies the effective degrees of freedom.
 """
-function whiten_data!(X::Matrix{T}; dims::Integer, df::Integer=size(X,dims)-1) where T
+function whiten_data_chol!(X::Matrix{T}; dims::Integer, df::Integer=size(X,dims)-1) where T
     df > 0 || error("degrees of freedom must be greater than 0")
 
     n, p = check_dims(X, dims=dims)
@@ -17,18 +17,18 @@ function whiten_data!(X::Matrix{T}; dims::Integer, df::Integer=size(X,dims)-1) w
 
     if dims == 1
         # X = QR ⟹ S = XᵀX = RᵀR
-        R = UpperTriangular(qr!(X, Val(false)).R)  
+        W⁻¹ = UpperTriangular(qr!(X, Val(false)).R)  
     else
         # Xᵀ = LQ ⟹ S = XXᵀ = LLᵀ = RᵀR
-        R = UpperTriangular(transpose(lq!(X).L))  
+        W⁻¹ = LowerTriangular(lq!(X).L)
     end
 
-    broadcast!(/, R, R, √(df))
+    broadcast!(/, W⁻¹, W⁻¹, √(df))
 
-    detΣ = det(R)^2
+    detΣ = det(W⁻¹)^2
 
     W = try
-        inv(R)
+        inv(W⁻¹)
     catch err
         if isa(err, LAPACKException) || isa(err, SingularException)
             if err.info ≥ 1
@@ -38,19 +38,15 @@ function whiten_data!(X::Matrix{T}; dims::Integer, df::Integer=size(X,dims)-1) w
         throw(err)
     end
 
-    if dims == 1
-        return (W, detΣ)
-    else
-        return (copy(transpose(W)), detΣ)
-    end
+    return (W, detΣ)
 end
 
 
 @inline regularize(x, y, γ) = (1-γ)*x + γ*y
 
 
-function whiten_data!(X::Matrix{T}, γ::Union{Nothing,T}; dims::Integer, 
-                      df::Integer=size(X,dims)-1) where T
+function whiten_data_svd!(X::Matrix{T}, γ::Union{Nothing,T}; dims::Integer, 
+                          df::Integer=size(X,dims)-1) where T
     n, p = check_dims(X, dims=dims)
     
     n > p || error("insufficient number of within-class observations to produce a full " *
@@ -90,27 +86,28 @@ function whiten_data!(X::Matrix{T}, γ::Union{Nothing,T}; dims::Integer,
 end
 
 
-function whiten_cov!(Σ::AbstractMatrix{T}, γ::Union{Nothing,T}=zero(T); 
-                     dims::Integer=1) where T
-    (p = size(Σ, 1)) == size(Σ, 2) || throw(DimensionMismatch("Σ must be square"))
+function whiten_cov_chol!(Σ::AbstractMatrix{T}, γ::Union{Nothing,T}=zero(T); 
+                          dims::Integer=1) where T
+    p, p₂ = check_dims(Σ, dims=dims)
 
-    0 ≤ γ ≤ 1 || throw(DomainError(γ, "γ must be in the interval [0,1]"))
-    
+    p == p₂ || throw(DimensionMismatch("Σ must be square"))
+
     if γ !== nothing && γ ≠ zero(T)
+        zero(T) ≤ γ ≤ one(T) || throw(DomainError(γ, "γ must be in the interval [0,1]"))
         regularize!(Σ, γ)
     end
 
     UᵀU = cholesky!(Σ, Val(false); check=true)
     
     if dims == 1
-        U = UᵀU.U
-        detΣ = det(U)^2
+        Lᵀ = UᵀU.U
+        detΣ = det(Lᵀ)^2
 
-        return (inv(U), detΣ)
+        return (inv(Lᵀ), detΣ)
     else
-        Uᵀ = UᵀU.L
-        detΣ = det(Uᵀ)^2
+        L = UᵀU.L
+        detΣ = det(L)^2
 
-        return (inv(Uᵀ), detΣ)
+        return (inv(L), detΣ)
     end 
 end
